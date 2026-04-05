@@ -159,4 +159,4 @@ The original BitNet b1.58 paper targets transformer-based LLMs. This project ind
 
 ## License
 
-[MIT](LICENSE)
+MIT — Copyright (c) 2026 Bhanu Chandar, [Axonyx Quantum Private Limited](https://github.com/bxf1001g)
