@@ -1,3 +1,7 @@
+<div align="center">
+  <img src="assets/banner.svg" width="100%" alt="bitnet-edge: Ternary-weight CNN training and multiply-free inference">
+</div>
+
 # bitnet-edge
 
 Ternary-weight CNN training and **multiply-free** bare-metal inference engine for edge devices.
