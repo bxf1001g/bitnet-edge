@@ -10,12 +10,8 @@
  *     because they are O(N) overhead, not O(N*K) like conv/linear.
  *   - Single file, standard C++ only. No BLAS, no Eigen, no framework.
  *   - Reads the .vbn binary format exported by export_model.py.
- *
- * Architecture:
- *   GroupNorm(1,1)  → Conv1(1→16, 3x3, pad=1) → ReLU → MaxPool(2)
- *   GroupNorm(1,16) → Conv2(16→32, 3x3, pad=1) → ReLU → MaxPool(2)
- *   Flatten → LayerNorm(1568) → FC1(1568→128) → ReLU
- *   LayerNorm(128) → FC2(128→10) → Argmax
+ *   - Fully dynamic: works with ANY model exported in VBN format
+ *     (MNIST 1x28x28, CIFAR-10 3x32x32, etc.)
  *
  * Build:
  *   g++ -O2 -std=c++17 -o vedu_inference vedu_inference.cpp
@@ -353,89 +349,91 @@ static void ternary_linear(
 }
 
 // ============================================================
-// Full forward pass
+// Full forward pass — fully dynamic, reads shapes from model
 // ============================================================
 
-static int forward(const Model& model, const float* input_784) {
-    // Layer 0: Conv1 (1→16, 3x3, pad=1)
-    // Input: [1, 28, 28], Output: [16, 28, 28]
-    const auto& L0 = model.layers[0];
-    float buf_a[1 * 28 * 28];   // normalized input
-    float buf_b[16 * 28 * 28];  // conv output
-    float buf_c[16 * 14 * 14];  // after pool
+static int forward(const Model& model, const float* input, int num_logits) {
+    // Derive spatial dims from test vector and first layer
+    int in_ch = model.layers[0].in_ch;
+    int total_input = (int)model.test_input.size();
+    int HW = total_input / in_ch;
+    int H = (int)sqrtf((float)HW);
+    int W = H;
 
-    // Copy input → buf_a
-    memcpy(buf_a, input_784, 784 * sizeof(float));
-    // GroupNorm(1, 1) on [1, 28, 28]
-    group_norm(buf_a, 1, 28, 28, L0.norm_gamma.data(), L0.norm_beta.data());
-    // Ternary conv
-    ternary_conv2d(buf_a, buf_b, L0.weights.data(), L0.bias.data(),
-                   1, 16, 3, 28, 28, 1, 1);
-    // ReLU
-    relu(buf_b, 16 * 28 * 28);
-    // MaxPool(2)
-    max_pool2d(buf_b, buf_c, 16, 28, 28);
+    // ---- Conv layers (type==0) with ReLU + MaxPool(2) ----
+    // We process conv layers sequentially, tracking spatial dims
 
-    // Layer 1: Conv2 (16→32, 3x3, pad=1)
-    // Input: [16, 14, 14], Output: [32, 14, 14]
-    const auto& L1 = model.layers[1];
-    float buf_d[16 * 14 * 14]; // normalized input
-    float buf_e[32 * 14 * 14]; // conv output
-    float buf_f[32 * 7 * 7];   // after pool
+    std::vector<float> cur_buf(input, input + total_input);
+    int cur_C = in_ch, cur_H = H, cur_W = W;
 
-    memcpy(buf_d, buf_c, 16 * 14 * 14 * sizeof(float));
-    // GroupNorm(1, 16) on [16, 14, 14]
-    group_norm(buf_d, 16, 14, 14, L1.norm_gamma.data(), L1.norm_beta.data());
-    // Ternary conv
-    ternary_conv2d(buf_d, buf_e, L1.weights.data(), L1.bias.data(),
-                   16, 32, 3, 14, 14, 1, 1);
-    // ReLU
-    relu(buf_e, 32 * 14 * 14);
-    // MaxPool(2)
-    max_pool2d(buf_e, buf_f, 32, 14, 14);
+    for (size_t li = 0; li < model.layers.size(); li++) {
+        const auto& L = model.layers[li];
 
-    // Flatten: [32, 7, 7] → [1568]
-    // buf_f is already flat
+        if (L.type == 0) {
+            // Conv layer: GroupNorm → TernaryConv → ReLU → MaxPool(2)
+            int oH = (cur_H + 2 * (int)L.padding - (int)L.ksize) / (int)L.stride + 1;
+            int oW = (cur_W + 2 * (int)L.padding - (int)L.ksize) / (int)L.stride + 1;
 
-    // Layer 2: FC1 (1568→128)
-    const auto& L2 = model.layers[2];
-    float buf_g[1568];  // normalized flat input
-    float buf_h[128];   // fc output
+            // GroupNorm in-place
+            group_norm(cur_buf.data(), cur_C, cur_H, cur_W,
+                       L.norm_gamma.data(), L.norm_beta.data());
 
-    memcpy(buf_g, buf_f, 1568 * sizeof(float));
-    // LayerNorm(1568)
-    layer_norm(buf_g, 1568, L2.norm_gamma.data(), L2.norm_beta.data());
-    // Ternary linear
-    ternary_linear(buf_g, buf_h, L2.weights.data(), L2.bias.data(),
-                   1568, 128);
-    // ReLU
-    relu(buf_h, 128);
+            // Conv
+            std::vector<float> conv_out(L.out_ch * oH * oW);
+            ternary_conv2d(cur_buf.data(), conv_out.data(),
+                           L.weights.data(), L.bias.data(),
+                           cur_C, L.out_ch, L.ksize, cur_H, cur_W,
+                           L.stride, L.padding);
 
-    // Layer 3: FC2 (128→10)
-    const auto& L3 = model.layers[3];
-    float buf_i[128];  // normalized input
-    float buf_j[10];   // logits
+            // ReLU
+            relu(conv_out.data(), (int)conv_out.size());
 
-    memcpy(buf_i, buf_h, 128 * sizeof(float));
-    // LayerNorm(128)
-    layer_norm(buf_i, 128, L3.norm_gamma.data(), L3.norm_beta.data());
-    // Ternary linear
-    ternary_linear(buf_i, buf_j, L3.weights.data(), L3.bias.data(),
-                   128, 10);
+            // MaxPool(2)
+            int pH = oH / 2, pW = oW / 2;
+            cur_buf.resize(L.out_ch * pH * pW);
+            max_pool2d(conv_out.data(), cur_buf.data(), L.out_ch, oH, oW);
 
-    // Argmax
-    int best = 0;
-    for (int i = 1; i < 10; i++) {
-        if (buf_j[i] > buf_j[best]) best = i;
+            cur_C = L.out_ch;
+            cur_H = pH;
+            cur_W = pW;
+
+        } else {
+            // Linear layer: LayerNorm → TernaryLinear → ReLU (except last)
+            int in_f = L.in_features;
+            int out_f = L.out_features;
+
+            // LayerNorm in-place
+            layer_norm(cur_buf.data(), in_f,
+                       L.norm_gamma.data(), L.norm_beta.data());
+
+            // Linear
+            std::vector<float> lin_out(out_f);
+            ternary_linear(cur_buf.data(), lin_out.data(),
+                           L.weights.data(), L.bias.data(),
+                           in_f, out_f);
+
+            // ReLU on all linear layers except the last
+            bool is_last = (li == model.layers.size() - 1);
+            if (!is_last) {
+                relu(lin_out.data(), out_f);
+            }
+
+            cur_buf = std::move(lin_out);
+        }
     }
 
-    // Print logits for debugging
+    // Print logits
     printf("  Logits: [");
-    for (int i = 0; i < 10; i++) {
-        printf("%.4f%s", buf_j[i], i < 9 ? ", " : "");
+    for (int i = 0; i < num_logits; i++) {
+        printf("%.4f%s", cur_buf[i], i < num_logits - 1 ? ", " : "");
     }
     printf("]\n");
 
+    // Argmax
+    int best = 0;
+    for (int i = 1; i < num_logits; i++) {
+        if (cur_buf[i] > cur_buf[best]) best = i;
+    }
     return best;
 }
 
@@ -463,15 +461,18 @@ int main(int argc, char** argv) {
     printf("Running inference on test image (expected: %d)...\n",
            model.test_expected);
 
+    // Determine number of output classes from last layer
+    int num_logits = model.layers.back().out_features;
+
     // Warmup
-    forward(model, model.test_input.data());
+    forward(model, model.test_input.data(), num_logits);
 
     // Benchmark
     const int RUNS = 100;
     auto t0 = std::chrono::high_resolution_clock::now();
     int prediction = -1;
     for (int i = 0; i < RUNS; i++) {
-        prediction = forward(model, model.test_input.data());
+        prediction = forward(model, model.test_input.data(), num_logits);
     }
     auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -496,17 +497,9 @@ int main(int argc, char** argv) {
     printf("  Class  C++          PyTorch      Delta\n");
     printf("  -----  -----------  -----------  -----------\n");
 
-    // Run once more to get logits (they were printed during forward)
-    // Actually let's just re-run and capture
-    float ref_logits_buf[10];
-    for (int i = 0; i < 10 && i < (int)model.test_logits.size(); i++) {
-        ref_logits_buf[i] = model.test_logits[i];
-    }
-
-    // We need the logits from C++. Let's modify to capture them.
-    // For now, print PyTorch reference:
+    // Print PyTorch reference:
     printf("  (PyTorch reference logits:)\n  ");
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < num_logits; i++) {
         printf("%.4f ", model.test_logits[i]);
     }
     printf("\n\n");

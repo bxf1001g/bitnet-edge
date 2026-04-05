@@ -14,7 +14,11 @@ Built from scratch in PyTorch, exported to a custom binary format (`.vbn`), and 
 - **Desktop C++** — zero dependencies, single-file engine
 - **ESP32-S3** — Arduino sketch, model in flash, inference in SRAM/PSRAM
 
-## Results (MNIST)
+The inference engine is **fully dynamic** — the same C/C++ code runs any model exported to `.vbn`, no recompilation needed.
+
+## Results
+
+### MNIST (Handwritten Digits, 1×28×28 grayscale)
 
 | Metric | FP32 Baseline | Ternary (bitnet-edge) |
 |---|---|---|
@@ -24,22 +28,32 @@ Built from scratch in PyTorch, exported to a custom binary format (`.vbn`), and 
 | Weight memory | 203 KB | 12.7 KB |
 | Multiplies at inference | 50,890 | **0** |
 
-### Hardware benchmarks
+### CIFAR-10 (Color Images, 3×32×32 RGB)
 
-| Platform | Latency | Throughput |
+| Metric | FP32 Baseline | Ternary (bitnet-edge) |
 |---|---|---|
-| Desktop (x86, g++ -O2) | 4.97 ms | 201 inf/sec |
-| ESP32-S3 (240 MHz, QSPI PSRAM) | 194.9 ms | 5 inf/sec |
+| Test Accuracy | 75.52% | 69.02% |
+| Accuracy Drop | — | -6.50% |
+| Bits per weight | 32 | 2 |
+| Weight memory | 1,074 KB | 67 KB |
+| Multiplies at inference | 268,464 | **0** |
+
+### Hardware Benchmarks
+
+| Platform | MNIST | CIFAR-10 |
+|---|---|---|
+| Desktop (x86, g++ -O2) | 4.97 ms / 201 inf/sec | 3.0 ms / 333 inf/sec |
+| ESP32-S3 (240 MHz, QSPI PSRAM) | 194.9 ms / 5 inf/sec | 333.3 ms / 3 inf/sec |
 
 ## Architecture
 
 ```
-Input (1x28x28)
-  → GroupNorm → TernaryConv2d(1→16, 3x3) → ReLU → MaxPool(2)
+Input (C×H×W)  — e.g. 1×28×28 (MNIST) or 3×32×32 (CIFAR-10)
+  → GroupNorm → TernaryConv2d(C→16, 3x3) → ReLU → MaxPool(2)
   → GroupNorm → TernaryConv2d(16→32, 3x3) → ReLU → MaxPool(2)
   → Flatten
-  → LayerNorm → TernaryLinear(1568→128) → ReLU
-  → LayerNorm → TernaryLinear(128→10)
+  → LayerNorm → TernaryLinear(32*(H/4)²→128) → ReLU
+  → LayerNorm → TernaryLinear(128→num_classes)
   → Argmax
 ```
 
@@ -54,8 +68,10 @@ bitnet-edge/
 │   └── models.py                   # BaselineCNN, VeduBitNetCNN
 │
 ├── scripts/
-│   ├── train.py                    # Train FP32 baseline + ternary model
-│   ├── export.py                   # Export trained model to .vbn
+│   ├── train.py                    # Train on MNIST
+│   ├── train_cifar10.py            # Train on CIFAR-10
+│   ├── export.py                   # Export MNIST model to .vbn
+│   ├── export_cifar10.py           # Export CIFAR-10 model to .vbn
 │   └── vbn_to_header.py            # Convert .vbn to C header for ESP32
 │
 ├── inference/
@@ -79,18 +95,27 @@ bitnet-edge/
 
 ```bash
 pip install -r requirements.txt
+
+# MNIST (grayscale digits)
 python scripts/train.py
+
+# CIFAR-10 (color images)
+python scripts/train_cifar10.py
 ```
 
-Trains both the FP32 baseline and the ternary model on MNIST. Saves checkpoints to `checkpoints/`.
+Trains both the FP32 baseline and the ternary model. Saves checkpoints to `checkpoints/`.
 
 ### 2. Export
 
 ```bash
+# MNIST
 python scripts/export.py
+
+# CIFAR-10
+python scripts/export_cifar10.py
 ```
 
-Produces `checkpoints/vedu_model.vbn` (~68 KB) containing ternary-packed weights, biases, normalization parameters, and a test vector.
+Produces a `.vbn` file containing ternary-packed weights, biases, normalization parameters, and a test vector.
 
 ### 3. Run on desktop (C++)
 
@@ -127,6 +152,56 @@ Ternary convolution:
 
 No multiplication circuit needed. The zero-weights give free sparsity — those inputs are ignored entirely.
 
+## Train on your own dataset
+
+The models accept parameterized input shapes. To train on a new image classification dataset:
+
+**1. Instantiate the models with your dimensions:**
+
+```python
+from bitnet_edge import BaselineCNN, VeduBitNetCNN
+
+# Example: 3-channel 64x64 images, 20 classes
+baseline = BaselineCNN(in_channels=3, img_size=64, num_classes=20)
+vedu     = VeduBitNetCNN(in_channels=3, img_size=64, num_classes=20)
+```
+
+- `in_channels`: 1 for grayscale, 3 for RGB
+- `img_size`: spatial dimension (images must be square, and divisible by 4)
+- `num_classes`: number of output classes
+
+**2. Copy and adapt a training script:**
+
+Copy `scripts/train_cifar10.py` and change:
+- The dataset class and transforms (use your own `Dataset` or a torchvision dataset)
+- `IN_CHANNELS`, `IMG_SIZE`, `NUM_CLASSES` to match your data
+- Normalization means/stds to match your dataset statistics
+- `EPOCHS` — ternary models benefit from more training (30+ recommended)
+- Learning rate: use `0.003` for ternary (3× the baseline LR)
+
+**3. Export and deploy:**
+
+The export script (`scripts/export.py`) works with any model that has `conv1`, `conv2`, `fc1`, `fc2` attributes. The C++ and ESP32 engines are fully dynamic — they read shapes from the `.vbn` file automatically. No recompilation needed.
+
+```bash
+python your_export_script.py                    # → your_model.vbn
+python scripts/vbn_to_header.py                 # → .h file for ESP32
+g++ -O2 -std=c++17 -o vedu_inference vedu_inference.cpp
+./vedu_inference your_model.vbn                 # desktop test
+```
+
+**Memory constraints for ESP32-S3 (2MB PSRAM):**
+
+| Image size | Input buffer | Conv1 output | Largest buffer | Fits? |
+|---|---|---|---|---|
+| 1×28×28 (MNIST) | 3.1 KB | 50 KB | 50 KB | Yes |
+| 3×32×32 (CIFAR-10) | 12 KB | 65 KB | 65 KB | Yes |
+| 3×64×64 | 48 KB | 262 KB | 262 KB | Yes |
+| 3×128×128 | 192 KB | 1,048 KB | 1,048 KB | Tight |
+| 3×224×224 | 588 KB | — | — | No |
+
+Rule of thumb: keep `16 × img_size × img_size × 4 bytes < 1.5 MB` for safe ESP32 deployment.
+
 ## VBN binary format
 
 The `.vbn` file is a self-contained model archive:
@@ -141,7 +216,7 @@ The `.vbn` file is a self-contained model archive:
 | Per layer: bias | float32[] | Bias vector |
 | Per layer: norm_gamma | float32[] | Normalization scale |
 | Per layer: norm_beta | float32[] | Normalization shift |
-| Test input | float32[784] | MNIST test image for verification |
+| Test input | float32[] | Test image for verification |
 | Test label | int32 | Expected prediction |
 
 2-bit encoding: `0 → 0b00`, `+1 → 0b01`, `-1 → 0b10`. 16 weights packed per uint32.

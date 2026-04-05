@@ -8,16 +8,11 @@
  *   2. Runs the test image through the multiply-free pipeline
  *   3. Reports prediction + timing over Serial
  *
- * Memory budget (ESP32 has 520KB SRAM):
- *   Model weights:    0 KB (stored in flash, not RAM)
- *   Working buffers: ~145 KB (stack + heap for inference)
- *   Free for app:   ~375 KB
+ * Fully dynamic: works with any VBN model (MNIST, CIFAR-10, etc.)
+ * Buffer sizes are computed from layer metadata at runtime.
  *
  * Board: ESP32 (any variant) or ESP32-S3
  * Upload: Arduino IDE → Tools → Board → ESP32 Dev Module
- *
- * For real camera deployment, add ESP32-CAM + OV2640
- * and pipe the downscaled grayscale frame into forward().
  */
 
 #include <cstdint>
@@ -53,6 +48,9 @@ static uint32_t  g_num_layers = 0;
 static float*   g_test_input = nullptr;
 static int32_t  g_test_expected = -1;
 static bool     g_has_test = false;
+
+// Input dimensions (derived from model + test vector)
+static uint32_t g_input_floats = 0;
 
 // ============================================================
 // Flash reader helpers
@@ -225,11 +223,13 @@ static bool parse_model() {
         g_has_test = true;
         uint32_t inp_size;
         r.read_u32(inp_size);
+        g_input_floats = inp_size;  // store for buffer allocation
         g_test_input = (float*)malloc(inp_size * 4);
         r.read_f32_array(g_test_input, inp_size);
         r.read_i32(g_test_expected);
         // Skip logits (we don't need them on ESP32)
-        Serial.printf("Test vector loaded (expected: %d)\n", g_test_expected);
+        Serial.printf("Test vector loaded (%u floats, expected: %d)\n",
+                      inp_size, g_test_expected);
     }
 
     return true;
@@ -385,90 +385,151 @@ static void ternary_linear(
 }
 
 // ============================================================
-// Full forward pass
+// Full forward pass — fully dynamic
 // ============================================================
-// Allocate working buffers on heap (too large for ESP32 stack)
+// Working buffers allocated once from PSRAM, sizes computed from model
 
-static float* buf_a = nullptr;  // [1*28*28] = 3136 bytes
-static float* buf_b = nullptr;  // [16*28*28] = 50176 bytes
-static float* buf_c = nullptr;  // [16*14*14] = 12544 bytes
-static float* buf_d = nullptr;  // [16*14*14] = 12544 bytes
-static float* buf_e = nullptr;  // [32*14*14] = 25088 bytes
-static float* buf_f = nullptr;  // [32*7*7]   = 6272 bytes
-static float* buf_g = nullptr;  // [1568]     = 6272 bytes
-static float* buf_h = nullptr;  // [128]      = 512 bytes
-static float* buf_i = nullptr;  // [128]      = 512 bytes
-static float* buf_j = nullptr;  // [10]       = 40 bytes
-// Total buffers: ~117 KB
+static float* g_work_a = nullptr;  // current activation buffer
+static float* g_work_b = nullptr;  // scratch buffer for conv/linear output
+static uint32_t g_work_a_size = 0; // size in floats
+static uint32_t g_work_b_size = 0;
+
+// Derived from model + test vector
+static int g_input_ch = 0;
+static int g_input_h  = 0;
+static int g_input_w  = 0;
+static int g_num_logits = 0;
 
 static bool alloc_buffers() {
-    // Use PSRAM (ps_malloc) for large buffers — internal SRAM is only 520KB
-    // and gets tight after model params are loaded. The board has 2MB PSRAM.
-#ifdef ESP32
-    #define ALLOC(sz) (float*)ps_malloc(sz)
-#else
-    #define ALLOC(sz) (float*)malloc(sz)
-#endif
-    buf_a = ALLOC(1 * 28 * 28 * sizeof(float));
-    buf_b = ALLOC(16 * 28 * 28 * sizeof(float));
-    buf_c = ALLOC(16 * 14 * 14 * sizeof(float));
-    buf_d = ALLOC(16 * 14 * 14 * sizeof(float));
-    buf_e = ALLOC(32 * 14 * 14 * sizeof(float));
-    buf_f = ALLOC(32 * 7 * 7 * sizeof(float));
-    buf_g = ALLOC(1568 * sizeof(float));
-    buf_h = ALLOC(128 * sizeof(float));
-    buf_i = ALLOC(128 * sizeof(float));
-    buf_j = ALLOC(10 * sizeof(float));
-#undef ALLOC
+    // Derive input spatial dims from test vector and first conv layer
+    g_input_ch = g_layers[0].in_ch;
+    // Count test input floats
+    // g_test_input was allocated with inp_size floats
+    // We stored that size; derive from test vector
+    // Actually we need to know the test input size — store it globally
+    // For now, compute from the model: in_ch is known,
+    // total = in_ch * H * W. We need H. Let's store inp_size during parse.
+    // (See parse_model — g_input_floats is set there)
 
-    if (!buf_a || !buf_b || !buf_c || !buf_d || !buf_e ||
-        !buf_f || !buf_g || !buf_h || !buf_i || !buf_j) {
+    if (g_input_floats == 0 || g_input_ch == 0) {
+        Serial.println("ERROR: Cannot derive input dims");
+        return false;
+    }
+
+    int hw = g_input_floats / g_input_ch;
+    g_input_h = (int)sqrtf((float)hw);
+    g_input_w = g_input_h;
+
+    Serial.printf("Input: %dx%dx%d (%u floats)\n",
+                  g_input_ch, g_input_h, g_input_w, g_input_floats);
+
+    // Compute max buffer size needed across all layers
+    uint32_t max_buf = g_input_floats; // start with input size
+    int cur_C = g_input_ch, cur_H = g_input_h, cur_W = g_input_w;
+
+    for (uint32_t i = 0; i < g_num_layers; i++) {
+        LayerData& L = g_layers[i];
+        if (L.type == 0) { // Conv
+            int oH = (cur_H + 2 * (int)L.padding - (int)L.ksize) / (int)L.stride + 1;
+            int oW = (cur_W + 2 * (int)L.padding - (int)L.ksize) / (int)L.stride + 1;
+            uint32_t conv_size = L.out_ch * oH * oW;
+            if (conv_size > max_buf) max_buf = conv_size;
+            // After pool
+            int pH = oH / 2, pW = oW / 2;
+            uint32_t pool_size = L.out_ch * pH * pW;
+            if (pool_size > max_buf) max_buf = pool_size;
+            cur_C = L.out_ch; cur_H = pH; cur_W = pW;
+        } else { // Linear
+            if (L.out_features > max_buf) max_buf = L.out_features;
+            if (L.in_features > max_buf) max_buf = L.in_features;
+        }
+    }
+
+    // Get num_logits from last layer
+    g_num_logits = g_layers[g_num_layers - 1].out_features;
+
+    // Allocate two buffers of max_buf size (ping-pong)
+    g_work_a_size = max_buf;
+    g_work_b_size = max_buf;
+
+#ifdef ESP32
+    g_work_a = (float*)ps_malloc(max_buf * sizeof(float));
+    g_work_b = (float*)ps_malloc(max_buf * sizeof(float));
+#else
+    g_work_a = (float*)malloc(max_buf * sizeof(float));
+    g_work_b = (float*)malloc(max_buf * sizeof(float));
+#endif
+
+    if (!g_work_a || !g_work_b) {
         Serial.println("ERROR: Buffer allocation failed!");
         return false;
     }
 
-    uint32_t total = (1*28*28 + 16*28*28 + 16*14*14 + 16*14*14 +
-                      32*14*14 + 32*7*7 + 1568 + 128 + 128 + 10) * 4;
-    Serial.printf("Working buffers: %u bytes (%.1f KB)\n", total, total/1024.0f);
+    uint32_t total = max_buf * 2 * sizeof(float);
+    Serial.printf("Working buffers: 2 x %u floats = %u bytes (%.1f KB)\n",
+                  max_buf, total, total / 1024.0f);
     return true;
 }
 
-static int forward(const float* input_784) {
-    // L0: GroupNorm → Conv1(1→16, 3x3, pad=1) → ReLU → MaxPool(2)
-    memcpy(buf_a, input_784, 784 * sizeof(float));
-    group_norm(buf_a, 1, 28, 28, g_layers[0].norm_gamma, g_layers[0].norm_beta);
-    ternary_conv2d(buf_a, buf_b, g_layers[0].weights, g_layers[0].bias,
-                   1, 16, 3, 28, 28, 1, 1);
-    relu(buf_b, 16 * 28 * 28);
-    max_pool2d(buf_b, buf_c, 16, 28, 28);
+static int forward(const float* input_data) {
+    // Copy input into work_a
+    memcpy(g_work_a, input_data, g_input_floats * sizeof(float));
 
-    // L1: GroupNorm → Conv2(16→32, 3x3, pad=1) → ReLU → MaxPool(2)
-    memcpy(buf_d, buf_c, 16 * 14 * 14 * sizeof(float));
-    group_norm(buf_d, 16, 14, 14, g_layers[1].norm_gamma, g_layers[1].norm_beta);
-    ternary_conv2d(buf_d, buf_e, g_layers[1].weights, g_layers[1].bias,
-                   16, 32, 3, 14, 14, 1, 1);
-    relu(buf_e, 32 * 14 * 14);
-    max_pool2d(buf_e, buf_f, 32, 14, 14);
+    int cur_C = g_input_ch, cur_H = g_input_h, cur_W = g_input_w;
 
-    // Flatten: [32,7,7] → [1568]
+    for (uint32_t li = 0; li < g_num_layers; li++) {
+        LayerData& L = g_layers[li];
 
-    // L2: LayerNorm → FC1(1568→128) → ReLU
-    memcpy(buf_g, buf_f, 1568 * sizeof(float));
-    layer_norm(buf_g, 1568, g_layers[2].norm_gamma, g_layers[2].norm_beta);
-    ternary_linear(buf_g, buf_h, g_layers[2].weights, g_layers[2].bias,
-                   1568, 128);
-    relu(buf_h, 128);
+        if (L.type == 0) {
+            // Conv: GroupNorm → TernaryConv → ReLU → MaxPool(2)
+            int oH = (cur_H + 2 * (int)L.padding - (int)L.ksize) / (int)L.stride + 1;
+            int oW = (cur_W + 2 * (int)L.padding - (int)L.ksize) / (int)L.stride + 1;
 
-    // L3: LayerNorm → FC2(128→10)
-    memcpy(buf_i, buf_h, 128 * sizeof(float));
-    layer_norm(buf_i, 128, g_layers[3].norm_gamma, g_layers[3].norm_beta);
-    ternary_linear(buf_i, buf_j, g_layers[3].weights, g_layers[3].bias,
-                   128, 10);
+            // GroupNorm in-place on g_work_a
+            group_norm(g_work_a, cur_C, cur_H, cur_W, L.norm_gamma, L.norm_beta);
 
-    // Argmax
+            // Conv → g_work_b
+            ternary_conv2d(g_work_a, g_work_b, L.weights, L.bias,
+                           cur_C, L.out_ch, L.ksize, cur_H, cur_W,
+                           L.stride, L.padding);
+
+            // ReLU in-place
+            relu(g_work_b, L.out_ch * oH * oW);
+
+            // MaxPool(2) → g_work_a
+            int pH = oH / 2, pW = oW / 2;
+            max_pool2d(g_work_b, g_work_a, L.out_ch, oH, oW);
+
+            cur_C = L.out_ch; cur_H = pH; cur_W = pW;
+
+        } else {
+            // Linear: LayerNorm → TernaryLinear → ReLU (except last)
+            int in_f = L.in_features;
+            int out_f = L.out_features;
+
+            // LayerNorm in-place on g_work_a
+            layer_norm(g_work_a, in_f, L.norm_gamma, L.norm_beta);
+
+            // Linear → g_work_b
+            ternary_linear(g_work_a, g_work_b, L.weights, L.bias, in_f, out_f);
+
+            // ReLU except last layer
+            bool is_last = (li == g_num_layers - 1);
+            if (!is_last) {
+                relu(g_work_b, out_f);
+            }
+
+            // Swap: copy g_work_b → g_work_a for next layer
+            memcpy(g_work_a, g_work_b, out_f * sizeof(float));
+        }
+    }
+
+    // g_work_a now contains the logits (copied from g_work_b after last linear)
+    // But actually last linear output is in g_work_b, then copied to g_work_a
+    // Argmax over g_work_a
     int best = 0;
-    for (int i = 1; i < 10; i++) {
-        if (buf_j[i] > buf_j[best]) best = i;
+    for (int i = 1; i < g_num_logits; i++) {
+        if (g_work_a[i] > g_work_a[best]) best = i;
     }
     return best;
 }
@@ -541,8 +602,8 @@ void setup() {
 
         // Print logits
         Serial.print("  Logits: [");
-        for (int i = 0; i < 10; i++) {
-            Serial.printf("%.2f%s", buf_j[i], i < 9 ? ", " : "");
+        for (int i = 0; i < g_num_logits; i++) {
+            Serial.printf("%.2f%s", g_work_a[i], i < g_num_logits - 1 ? ", " : "");
         }
         Serial.println("]");
     }
