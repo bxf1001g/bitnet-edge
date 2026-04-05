@@ -36,3 +36,4 @@ Thumbs.db
 # Legacy flat files (moved to proper folders)
 mnist_data/
 docs/reddit_posts.md
+docs/paper.md
