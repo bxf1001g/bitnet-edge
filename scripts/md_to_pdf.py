@@ -97,6 +97,9 @@ a {{
     color: #1565c0;
     text-decoration: none;
 }}
+.page-break {{
+    page-break-before: always;
+}}
 </style>
 </head>
 <body>

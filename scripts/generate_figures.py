@@ -111,17 +111,17 @@ ax.legend()
 ax.set_ylim(0, 110)
 ax.grid(True, alpha=0.2, axis='y')
 
-# Add value labels
+# Add value labels on top of bars
 for bar in bars1:
-    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
+    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1.5,
             f'{bar.get_height():.2f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
 for bar in bars2:
-    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1,
+    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 1.5,
             f'{bar.get_height():.2f}%', ha='center', va='bottom', fontsize=10, fontweight='bold')
 
-# Add drop annotations
-ax.annotate('-0.23 pp', xy=(0.15, 98.79), fontsize=9, color='red', fontweight='bold')
-ax.annotate('-6.50 pp', xy=(1.15, 69.02), fontsize=9, color='red', fontweight='bold')
+# Add drop annotations - positioned with arrows pointing to the gap
+ax.annotate('-0.23 pp', xy=(0.15, 105), fontsize=10, color='red', fontweight='bold', ha='center')
+ax.annotate('-6.50 pp', xy=(1.15, 78), fontsize=10, color='red', fontweight='bold', ha='center')
 
 plt.tight_layout()
 plt.savefig(f"{OUT_DIR}/accuracy_comparison.png")
@@ -184,17 +184,19 @@ ax.legend()
 ax.grid(True, alpha=0.2, axis='y')
 
 for bar in bars1:
-    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 15,
+    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 20,
             f'{bar.get_height():.0f} KB', ha='center', va='bottom', fontsize=10)
 for bar in bars2:
-    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 15,
+    ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 20,
             f'{bar.get_height():.1f} KB', ha='center', va='bottom', fontsize=10)
 
-# Add 16x arrow
-ax.annotate('16×\nsmaller', xy=(0.15, 50), fontsize=11, color='#D32F2F',
-            fontweight='bold', ha='center')
-ax.annotate('16×\nsmaller', xy=(1.15, 200), fontsize=11, color='#D32F2F',
-            fontweight='bold', ha='center')
+# Add 16x annotations with arrows pointing from FP32 bar down to ternary bar
+ax.annotate('16×', xy=(0, 12.7), xytext=(0, 120),
+            fontsize=13, color='#D32F2F', fontweight='bold', ha='center',
+            arrowprops=dict(arrowstyle='->', color='#D32F2F', lw=2))
+ax.annotate('16×', xy=(1, 67), xytext=(1, 600),
+            fontsize=13, color='#D32F2F', fontweight='bold', ha='center',
+            arrowprops=dict(arrowstyle='->', color='#D32F2F', lw=2))
 
 plt.tight_layout()
 plt.savefig(f"{OUT_DIR}/memory_compression.png")
